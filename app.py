@@ -1,6 +1,7 @@
-# fx_anomaly_streamlit_app.py
-# Streamlit UI to upload an ERP CSV, flag anomalies with a pre‑trained Isolation Forest pipeline,
-# and let the user download the scored file.
+# app.py – Enhanced FX Exposure Anomaly Detector with Business‑Friendly Risk Levels
+# ---------------------------------------------------------------
+# Streamlit UI: Upload ERP CSV → Score with Isolation Forest → Display risk buckets and allow download.
+# ---------------------------------------------------------------
 
 import streamlit as st
 import pandas as pd
@@ -8,129 +9,136 @@ import numpy as np
 import joblib
 from io import BytesIO
 
-# ------------------------------------------------------
+# ---------------------------------------------------------------
 # Helper functions
-# ------------------------------------------------------
+# ---------------------------------------------------------------
 
 def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Replicate training‑time feature engineering."""
+    """Replicate training‑time feature engineering (date deltas, log amounts)."""
     df = df.copy()
-    # Ensure expected columns exist
-    date_cols = ["Transaction_Date", "Due_Date"]
-    for col in date_cols:
-        if col not in df.columns:
-            st.error(f"Missing required date column: {col}")
-            st.stop()
+    required_cols = ["Transaction_Date", "Due_Date", "Amount_USD"]
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        st.error(f"Missing required columns: {', '.join(missing)}")
+        st.stop()
 
     df["Transaction_Date"] = pd.to_datetime(df["Transaction_Date"], errors="coerce")
     df["Due_Date"] = pd.to_datetime(df["Due_Date"], errors="coerce")
-
-    if df[["Transaction_Date", "Due_Date"]].isna().any().any():
-        st.warning("Some dates could not be parsed and will be set to NaT → rows may score higher as anomalies.")
-
     df["Days_To_Due"] = (df["Due_Date"] - df["Transaction_Date"]).dt.days
-    if "Amount_USD" not in df.columns:
-        st.error("Missing required monetary column: Amount_USD")
-        st.stop()
-
     df["Log_Amount_USD"] = np.log1p(df["Amount_USD"].clip(lower=0))
     return df
 
 
 def score_anomalies(model, df_fe: pd.DataFrame) -> pd.DataFrame:
-    """Return dataframe with anomaly_score and is_anomaly flag."""
-    df_scored = df_fe.copy()
-    df_scored["anomaly_score"] = -model.decision_function(df_fe)
-    df_scored["is_anomaly"] = model.predict(df_fe) == -1
-    return df_scored
+    """Return dataframe with raw score, percentile, risk bucket, and business flag."""
+    scored = df_fe.copy()
+    scored["anomaly_score"] = -model.decision_function(df_fe)
+    scored["anomaly_percentile"] = scored["anomaly_score"].rank(pct=True) * 100
+    scored["anomaly_percentile"] = scored["anomaly_percentile"].round(2)
+
+    def map_risk(p):
+        if p >= 98:
+            return "🔴 High Risk"
+        elif p >= 90:
+            return "🟠 Moderate Risk"
+        elif p >= 75:
+            return "🟡 Low Risk"
+        else:
+            return "🟢 Normal"
+
+    scored["risk_level"] = scored["anomaly_percentile"].apply(map_risk)
+
+    def business_msg(risk):
+        return {
+            "🔴 High Risk": "Potential FX exposure issue – investigate immediately",
+            "🟠 Moderate Risk": "Review for misclassification or unusual terms",
+            "🟡 Low Risk": "Minor outlier – monitor",
+            "🟢 Normal": "No action needed",
+        }[risk]
+
+    scored["business_flag"] = scored["risk_level"].apply(business_msg)
+    scored["is_anomaly"] = scored["risk_level"].isin(["🔴 High Risk", "🟠 Moderate Risk"])
+    return scored
 
 
 def to_csv_download(df: pd.DataFrame) -> BytesIO:
-    """Convert DataFrame to CSV BytesIO for download button."""
-    buffer = BytesIO()
-    df.to_csv(buffer, index=False)
-    buffer.seek(0)
-    return buffer
+    buf = BytesIO()
+    df.to_csv(buf, index=False)
+    buf.seek(0)
+    return buf
 
-# ------------------------------------------------------
+# ---------------------------------------------------------------
 # Streamlit layout
-# ------------------------------------------------------
+# ---------------------------------------------------------------
 
-st.set_page_config(page_title="FX Exposure Anomaly Detector", layout="wide")
-
+st.set_page_config(page_title="FX Anomaly Detector", layout="wide")
 st.title("📊 FX Exposure Anomaly Detector")
-st.markdown(
-    "Upload a monthly ERP FX exposure extract (CSV). The app will flag unusual invoices, intercompany entries, or payables/receivables using a pre‑trained Isolation Forest model."
-)
+st.write("Upload an ERP FX exposure CSV. The app flags anomalies and maps them to business‑friendly risk levels.")
 
-# Sidebar for model upload / selection
+# Sidebar – load model
 with st.sidebar:
     st.header("Model")
-    default_path = "fx_anomaly_pipeline.pkl"
-    model_file = st.file_uploader(
-        "Upload trained model (*.pkl) or leave empty to use default pipeline.",
-        type=["pkl"],
-        key="model_uploader",
-    )
-
-    if model_file is not None:
-        # User‑supplied model
-        model = joblib.load(model_file)
+    mdl_file = st.file_uploader("Upload .pkl model (optional)", type=["pkl"])
+    default_model = "fx_anomaly_pipeline.pkl"
+    if mdl_file:
+        model = joblib.load(mdl_file)
         st.success("Custom model loaded ✅")
     else:
         try:
-            model = joblib.load(default_path)
+            model = joblib.load(default_model)
             st.info("Using default model fx_anomaly_pipeline.pkl")
         except FileNotFoundError:
-            st.error("Default model not found. Please upload a model .pkl file in the sidebar.")
+            st.error("Default model not found. Upload one on the sidebar.")
             st.stop()
 
-st.divider()
-
-uploaded_file = st.file_uploader("Upload ERP CSV (e.g., june2025_erp_extract.csv)", type=["csv"])
-
-if uploaded_file is not None:
-    with st.spinner("Reading CSV…"):
-        df_raw = pd.read_csv(uploaded_file)
-
-    st.subheader("📄 Raw Data Preview")
-    st.dataframe(df_raw.head(), use_container_width=True)
-
-    # Feature engineering
-    with st.spinner("Engineering features & scoring anomalies…"):
-        df_fe = engineer_features(df_raw)
-        df_scored = score_anomalies(model, df_fe)
-
-    # Show anomaly summary
-    total_rows = len(df_scored)
-    anomalies = df_scored["is_anomaly"].sum()
-    st.metric("Total rows", total_rows)
-    st.metric("Anomalies detected", anomalies)
-
-    # Display top anomalies table
-    st.subheader("🚩 Top 25 Most Anomalous Rows")
-    top_n = df_scored.sort_values("anomaly_score", ascending=False).head(25)
-    st.dataframe(top_n[
-        [
-            "Invoice_ID",
-            "Entity",
-            "Type",
-            "Currency",
-            "Amount_FCY",
-            "Amount_USD",
-            "Days_To_Due",
-            "anomaly_score",
-        ]
-    ], use_container_width=True)
-
-    # Download full scored CSV
-    csv_bytes = to_csv_download(df_scored)
-    st.download_button(
-        label="📥 Download full scored CSV",
-        data=csv_bytes,
-        file_name="scored_" + uploaded_file.name,
-        mime="text/csv",
-    )
-
-else:
+# Main – upload ERP CSV
+csv_file = st.file_uploader("Upload ERP CSV", type=["csv"])
+if not csv_file:
     st.info("Awaiting ERP CSV upload…")
+    st.stop()
+
+# Read and preview
+raw_df = pd.read_csv(csv_file)
+st.subheader("Raw Data Preview")
+st.dataframe(raw_df.head(), use_container_width=True)
+
+# Engineer, score, and enrich
+with st.spinner("Scoring anomalies…"):
+    fe_df = engineer_features(raw_df)
+    scored_df = score_anomalies(model, fe_df)
+
+# KPIs
+total = len(scored_df)
+high = (scored_df["risk_level"] == "🔴 High Risk").sum()
+moderate = (scored_df["risk_level"] == "🟠 Moderate Risk").sum()
+st.metric("Total Records", total)
+st.metric("High Risk", high)
+st.metric("Moderate Risk", moderate)
+
+# Show top anomalies
+st.subheader("Top 25 Anomalies (by percentile)")
+cols_show = [
+    "Invoice_ID",
+    "Entity",
+    "Type",
+    "Currency",
+    "Amount_USD",
+    "Days_To_Due",
+    "anomaly_percentile",
+    "risk_level",
+    "business_flag",
+]
+
+st.dataframe(
+    scored_df.sort_values("anomaly_percentile", ascending=False).head(25)[cols_show],
+    use_container_width=True,
+)
+
+# Download button
+csv_download = to_csv_download(scored_df)
+st.download_button(
+    label="📥 Download scored CSV",
+    data=csv_download,
+    file_name="scored_" + csv_file.name,
+    mime="text/csv",
+)
